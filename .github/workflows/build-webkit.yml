@@ -1,0 +1,284 @@
+name: Build WebKit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          filter: blob:none
+
+      - name: Disk space
+        run: df -h /
+
+      - name: Clone WebKit (shallow)
+        run: git clone --depth 1 --branch wpewebkit-2.52.3 https://github.com/WebKit/WebKit.git webkit-src
+
+      - name: Disk space after clone
+        run: df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo add-apt-repository -y universe
+          sudo apt-get update
+          # Remove git-svn from deps (conflicts with runner's newer git PPA)
+          sed -i '/git-svn/d' webkit-src/Tools/wpe/dependencies/apt webkit-src/Tools/glib/dependencies/apt
+          sudo webkit-src/Tools/wpe/install-dependencies
+          sudo apt-get install -y ninja-build cmake
+
+      - name: Build libwpe from source
+        run: |
+          git clone --depth 1 https://github.com/WebPlatformForEmbedded/libwpe.git
+          cmake -S libwpe -B libwpe-build -DCMAKE_INSTALL_PREFIX=/usr -GNinja
+          ninja -C libwpe-build
+          sudo ninja -C libwpe-build install
+
+      - name: Configure WebKit
+        run: |
+          cmake -S webkit-src -B build \
+            -DPORT=WPE \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_WEB_AUDIO=OFF \
+            -DENABLE_WEB_CRYPTO=OFF \
+            -DENABLE_WEBRTC=OFF \
+            -DENABLE_GEOLOCATION=OFF \
+            -DENABLE_SPELLCHECK=OFF \
+            -DENABLE_DRAG_SUPPORT=OFF \
+            -DENABLE_TOUCH_EVENTS=OFF \
+            -DENABLE_WEBDRIVER=OFF \
+            -DENABLE_SAMPLING_PROFILER=OFF \
+            -DENABLE_MEDIA_SOURCE=OFF \
+            -DENABLE_VIDEO=ON \
+            -DUSE_LIBBACKTRACE=OFF \
+            -GNinja
+
+      - name: Build
+        run: |
+          PEAK_MEM_FILE=$(mktemp)
+          echo "0" > "$PEAK_MEM_FILE"
+          (
+            while true; do
+              USED=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{print int((t-a)/1024)}' /proc/meminfo)
+              PREV=$(cat "$PEAK_MEM_FILE")
+              [ "$USED" -gt "$PREV" ] 2>/dev/null && echo "$USED" > "$PEAK_MEM_FILE"
+              sleep 5
+            done
+          ) &
+          MEM_PID=$!
+
+          START=$(date +%s)
+          ninja -C build 2>&1 | tail -20
+          END=$(date +%s)
+
+          kill $MEM_PID 2>/dev/null || true
+          echo "BUILD_TIME=$((END - START))" >> "$GITHUB_ENV"
+          echo "PEAK_MEM_MB=$(cat "$PEAK_MEM_FILE")" >> "$GITHUB_ENV"
+          rm -f "$PEAK_MEM_FILE"
+
+      - name: Collect metrics
+        if: always()
+        run: |
+          mkdir -p metrics
+
+          BUILD_DIR_SIZE=$(du -sm build/ 2>/dev/null | cut -f1 || echo "N/A")
+          SOURCE_DIR_SIZE=$(du -sm webkit-src/ 2>/dev/null | cut -f1 || echo "N/A")
+          DISK_FREE=$(df -m / | tail -1 | awk '{print $4}')
+          DISK_TOTAL=$(df -m / | tail -1 | awk '{print $2}')
+
+          LARGEST_LIB=""
+          LARGEST_LIB_SIZE="N/A"
+          STRIPPED_SIZE="N/A"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            SIZE=$(ls -l "$f" | awk '{print $5}')
+            LARGEST_LIB="$f"
+            LARGEST_LIB_SIZE=$((SIZE / 1048576))
+            if cp "$f" /tmp/strip-target 2>/dev/null; then
+              strip --strip-all /tmp/strip-target 2>/dev/null || true
+              SSIZE=$(ls -l /tmp/strip-target | awk '{print $5}')
+              STRIPPED_SIZE=$((SSIZE / 1048576))
+            fi
+          done < <(find build/lib -name "*.so" -type f 2>/dev/null | head -5)
+
+          cat > metrics/linux-x86_64.json <<EOF
+          {
+            "platform": "linux-x86_64",
+            "port": "WPE",
+            "build_time_s": "${BUILD_TIME:-N/A}",
+            "build_dir_mb": "${BUILD_DIR_SIZE}",
+            "source_dir_mb": "${SOURCE_DIR_SIZE}",
+            "disk_free_mb": "${DISK_FREE}",
+            "disk_total_mb": "${DISK_TOTAL}",
+            "peak_mem_mb": "${PEAK_MEM_MB:-N/A}",
+            "largest_lib_mb": "${LARGEST_LIB_SIZE}",
+            "stripped_lib_mb": "${STRIPPED_SIZE}",
+            "largest_lib": "$(basename "${LARGEST_LIB}" 2>/dev/null || echo "N/A")"
+          }
+          EOF
+
+          cat metrics/linux-x86_64.json
+
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-linux-x86_64
+          path: metrics/
+
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          filter: blob:none
+
+      - name: Disk space
+        run: df -h /
+
+      - name: Clone WebKit (shallow)
+        run: git clone --depth 1 https://github.com/WebKit/WebKit.git webkit-src
+
+      - name: Disk space after clone
+        run: df -h /
+
+      - name: Build WebKit
+        run: |
+          PEAK_MEM_FILE=$(mktemp)
+          echo "0" > "$PEAK_MEM_FILE"
+          (
+            while true; do
+              PAGE_SIZE=$(sysctl -n hw.pagesize)
+              PAGES_USED=$(vm_stat | awk '/Pages active|Pages wired/ {gsub(/\./,"",$NF); sum+=$NF} END{print sum}')
+              USED=$((PAGES_USED * PAGE_SIZE / 1048576))
+              PREV=$(cat "$PEAK_MEM_FILE")
+              [ "$USED" -gt "$PREV" ] 2>/dev/null && echo "$USED" > "$PEAK_MEM_FILE"
+              sleep 5
+            done
+          ) &
+          MEM_PID=$!
+
+          START=$(date +%s)
+          cd webkit-src
+          Tools/Scripts/build-webkit --release 2>&1 | tail -30
+          END=$(date +%s)
+
+          kill $MEM_PID 2>/dev/null || true
+          echo "BUILD_TIME=$((END - START))" >> "$GITHUB_ENV"
+          echo "PEAK_MEM_MB=$(cat "$PEAK_MEM_FILE")" >> "$GITHUB_ENV"
+          rm -f "$PEAK_MEM_FILE"
+
+      - name: Collect metrics
+        if: always()
+        run: |
+          mkdir -p metrics
+
+          BUILD_DIR=${WEBKIT_OUTPUTDIR:-webkit-src/WebKitBuild}
+          BUILD_DIR_SIZE=$(du -sm "$BUILD_DIR" 2>/dev/null | cut -f1 || echo "N/A")
+          SOURCE_DIR_SIZE=$(du -sm webkit-src/ 2>/dev/null | cut -f1 || echo "N/A")
+          DISK_FREE=$(df -m / | tail -1 | awk '{print $4}')
+          DISK_TOTAL=$(df -m / | tail -1 | awk '{print $2}')
+
+          LARGEST_LIB=""
+          LARGEST_LIB_SIZE="N/A"
+          STRIPPED_SIZE="N/A"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            SIZE=$(ls -l "$f" | awk '{print $5}')
+            LARGEST_LIB="$f"
+            LARGEST_LIB_SIZE=$((SIZE / 1048576))
+            if cp "$f" /tmp/strip-target 2>/dev/null; then
+              strip -x /tmp/strip-target 2>/dev/null || true
+              SSIZE=$(ls -l /tmp/strip-target | awk '{print $5}')
+              STRIPPED_SIZE=$((SSIZE / 1048576))
+            fi
+          done < <(find "$BUILD_DIR" -name "*.dylib" -type f 2>/dev/null | head -5)
+
+          cat > metrics/macos-arm64.json <<EOF
+          {
+            "platform": "macos-arm64",
+            "port": "Mac (Xcode)",
+            "build_time_s": "${BUILD_TIME:-N/A}",
+            "build_dir_mb": "${BUILD_DIR_SIZE}",
+            "source_dir_mb": "${SOURCE_DIR_SIZE}",
+            "disk_free_mb": "${DISK_FREE}",
+            "disk_total_mb": "${DISK_TOTAL}",
+            "peak_mem_mb": "${PEAK_MEM_MB:-N/A}",
+            "largest_lib_mb": "${LARGEST_LIB_SIZE}",
+            "stripped_lib_mb": "${STRIPPED_SIZE}",
+            "largest_lib": "$(basename "${LARGEST_LIB}" 2>/dev/null || echo "N/A")"
+          }
+          EOF
+
+          cat metrics/macos-arm64.json
+
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-macos-arm64
+          path: metrics/
+
+  summary:
+    needs: [build-linux, build-macos]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all metrics
+        uses: actions/download-artifact@v4
+        with:
+          pattern: metrics-*
+          merge-multiple: true
+          path: metrics/
+
+      - name: Generate summary table
+        run: |
+          PLATFORMS=()
+          for f in metrics/*.json; do
+            PLATFORMS+=("$(basename "$f" .json)")
+          done
+
+          HEADER="| Metric"
+          SEPARATOR="|---"
+          for p in "${PLATFORMS[@]}"; do
+            HEADER="$HEADER | $p"
+            SEPARATOR="$SEPARATOR|---"
+          done
+          HEADER="$HEADER |"
+          SEPARATOR="$SEPARATOR|"
+
+          {
+            echo "## WebKit Build Results"
+            echo ""
+            echo "$HEADER"
+            echo "$SEPARATOR"
+
+            for key in port build_time_s peak_mem_mb build_dir_mb source_dir_mb largest_lib largest_lib_mb stripped_lib_mb disk_free_mb disk_total_mb; do
+              LABEL=$(echo "$key" | sed 's/_/ /g')
+              ROW="| $LABEL"
+              for f in metrics/*.json; do
+                VAL=$(grep "\"$key\"" "$f" | cut -d'"' -f4)
+                case "$key" in
+                  *_mb) VAL="${VAL} MB" ;;
+                  *_s) VAL="${VAL}s" ;;
+                esac
+                ROW="$ROW | $VAL"
+              done
+              echo "$ROW |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
